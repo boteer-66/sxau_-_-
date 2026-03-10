@@ -53,6 +53,13 @@
 #include "servotext_boteer.c"
 #include "motortext_boteer.h"
 
+#define RX_RING_SIZE 128                // 环形缓冲区大小
+uint8_t rx_ring[RX_RING_SIZE];          // 环形缓冲区
+volatile uint16_t rx_ring_head = 0;      // 写指针（中断中更新）
+volatile uint16_t rx_ring_tail = 0;      // 读指针（主循环中更新）
+uint8_t rx_byte;                         // 单字节接收缓存（用于中断）
+
+//原有的 rx_buffer 现在用作行缓冲区，不再直接参与接收，rx_index 和 rx_complete_flag 继续保留，用法不变
 #define RX_BUFFER_SIZE  64      // 接收缓冲区大小
 uint8_t rx_buffer[RX_BUFFER_SIZE];      // 串口接收缓冲区
 uint8_t rx_index = 0;                  // 当前接收位置
@@ -89,6 +96,38 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+//改版添加了行提取函数
+static uint8_t GetLineFromRing(char *line_buf, uint16_t max_len)
+{
+  static uint16_t idx = 0;  // 当前行缓冲区索引
+
+  while (rx_ring_tail != rx_ring_head)
+  {
+    uint8_t ch = rx_ring[rx_ring_tail];
+    rx_ring_tail = (rx_ring_tail + 1) % RX_RING_SIZE;
+
+    // 遇到换行符或缓冲区满，认为一行结束
+    if (ch == '\n' || ch == '\r' || idx >= max_len - 1)
+    {
+      // 忽略空行（只有换行符）
+      if (idx == 0)
+      {
+        continue;
+      }
+      line_buf[idx] = '\0';  // 字符串结束
+      idx = 0;
+      return 1;  // 一行就绪
+    }
+    else
+    {
+      line_buf[idx++] = ch;  // 存入行缓冲区
+    }
+  }
+  return 0;  // 没有完整行
+}
+
+
 
 
 
@@ -131,42 +170,6 @@ void Parse_Command(char *cmd, uint16_t len)
     printf("Unknown command. Use #<id>=<angle> (e.g. #1=90)\r\n");
   }
 }
-
-
-
-          // void Parse_Command(char *cmd, uint16_t len)
-          // {
-          //   // 去除末尾的\r或\n
-          //   if (len > 0 && (cmd[len-1] == '\n' || cmd[len-1] == '\r')) cmd[len-1] = '\0';
-          //   if (len > 1 && cmd[len-2] == '\r') cmd[len-2] = '\0';
-          //
-          //   // 打印收到的原始指令（调试用）
-          //   printf("接收到指令: [%s]\r\n", cmd);
-          //
-          //   int angle;
-          //   if (sscanf(cmd, "ANGLE=%d", &angle) == 1)
-          //   {
-          //     if (angle >= 0 && angle <= 180)
-          //     {
-          //       // 使用平滑移动，指定移动时间500ms
-          //       Servo_SmoothMoveToAngle(&my_servo, (uint8_t)angle, 500);
-          //       printf("Moving to angle %d smoothly...\r\n", angle);
-          //
-          //       //Servo_SetAngle(&my_servo, (uint8_t)angle);
-          //       //printf("OK, 角度设置为 : %d\r\n", angle);
-          //     }
-          //     else
-          //     {
-          //       printf("Error: 角度必须为 ： 0-180\r\n");
-          //     }
-          //   }
-          //   else
-          //   {
-          //     printf("未知指令. 请使用指令： ANGLE=xxx\r\n");
-          //   }
-          // }
-
-
 
 
 
@@ -236,7 +239,9 @@ int main(void)
 
 
 
-  HAL_UART_Receive_IT(&huart2, rx_buffer, 1);
+
+  HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
+
   printf("System Ready. 5 servos initialized.\r\n");
   printf("\r\n====波特儿 Servo Control System====\r\n");
   printf("   等待输入指令中...............\r\n");
@@ -249,51 +254,12 @@ int main(void)
 
 
 
-
-  ///////////////////////////////////
-  ///
-  ///
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
-  ///
-  ////////////////////////////////////
-
-
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    __HAL_TIM_SET_COMPARE(&htim2,TIM_CHANNEL_3,1800);
-    HAL_Delay(500);
-   // __HAL_TIM_SET_COMPARE(&htim2,TIM_CHANNEL_3,1000);
-    //HAL_Delay(500);
-
-
-    // uint32_t now = HAL_GetTick();
-    // if (now - last_time >= 2000)  // 2秒切换
-    // {
-    //   last_time = now;
-    //   test_state = (test_state + 1) % 3;  // 0->1->2->0...
-    //
-    //   switch (test_state)
-    //   {
-    //   case 0:  // 正转
-    //     Motor_SetSpeed(&my_motor, 150, 150);  // 左、右轮正转速度150
-    //     printf("Test: Forward 150\n");
-    //     break;
-    //   case 1:  // 反转
-    //     Motor_SetSpeed(&my_motor, -150, -150); // 左、右轮反转速度150
-    //     printf("Test: Reverse 150\n");
-    //     break;
-    //   case 2:  // 停止
-    //     Motor_SetSpeed(&my_motor, 0, 0);
-    //     printf("Test: Stop\n");
-    //     break;
-    //   }
-    // }
-
-
 
 
     Servo_Update(&servo1);
@@ -305,6 +271,13 @@ int main(void)
     Motor_Update(&my_motor);
 
 
+    // 【新增】从环形缓冲区读取一行，存入 rx_buffer
+    if (GetLineFromRing((char *)rx_buffer, RX_BUFFER_SIZE))
+    {
+      rx_index = strlen((char *)rx_buffer);  // 计算实际长度
+      rx_complete_flag = 1;                   // 触发解析
+    }
+
     if (rx_complete_flag)
     {
       Parse_Command((char *)rx_buffer, rx_index);
@@ -314,7 +287,8 @@ int main(void)
       rx_complete_flag = 0;
 
       // 重新开启接收
-      HAL_UART_Receive_IT(&huart2, rx_buffer, 1);
+      //改版部分该部分代码已被删除，接受将由环形缓冲区持续处理
+      //HAL_UART_Receive_IT(&huart2, rx_buffer, 1);
     }
 
 
@@ -369,21 +343,30 @@ void SystemClock_Config(void)
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-  if (huart->Instance == USART2)          // 注意改成 USART2
+  if (huart->Instance == USART2)
   {
-    // 遇到换行符或缓冲区满，认为一行结束
-    if (rx_buffer[rx_index] == '\n' || rx_index >= RX_BUFFER_SIZE - 1)
+    // 将字节存入环形缓冲区（如果未满）
+    uint16_t next_head = (rx_ring_head + 1) % RX_RING_SIZE;
+    if (next_head != rx_ring_tail)
     {
-      rx_complete_flag = 1;
+      rx_ring[rx_ring_head] = rx_byte;
+      rx_ring_head = next_head;
     }
-    else
-    {
-      rx_index++;
-      HAL_UART_Receive_IT(huart, &rx_buffer[rx_index], 1);
-    }
+    // 重新启动接收（使用 rx_byte 作为缓存）
+    HAL_UART_Receive_IT(huart, &rx_byte, 1);
   }
 }
 
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    __HAL_UART_CLEAR_OREFLAG(huart);
+    __HAL_UART_CLEAR_NEFLAG(huart);
+    __HAL_UART_CLEAR_FEFLAG(huart);
+    HAL_UART_Receive_IT(huart, &rx_byte, 1);
+  }
+}
 
 
 
